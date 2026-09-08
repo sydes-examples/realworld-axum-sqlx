@@ -1,0 +1,22 @@
+name: Sydes
+
+# Sydes runs as an independent PR check alongside the repository's existing
+# CI. All implementation lives in the reusable workflow — see
+# https://github.com/sydes-examples/.github for the workflow, renderer, and
+# the frozen v1 presentation contract this repo relies on.
+
+on:
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  sydes:
+    uses: sydes-examples/.github/.github/workflows/sydes-verify.yml@main
+    with:
+      repo_alias: app
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
