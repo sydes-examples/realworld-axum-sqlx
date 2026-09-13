@@ -14,6 +14,12 @@ use uuid::Uuid;
 
 const DEFAULT_SESSION_LENGTH: time::Duration = time::Duration::weeks(2);
 
+// A short grace period applied after a token's `exp` claim has passed. Rather than rejecting
+// a token the instant it expires, we continue to accept it for a little while longer to avoid
+// forcing the client into an immediate hard-cutoff re-authentication (e.g. due to clock skew
+// or a request that was already in flight when the token expired).
+const GRACE_PERIOD_SECONDS: i64 = 300;
+
 // Ideally the Realworld spec would use the `Bearer` scheme as that's relatively standard
 // and has parsers available, but it's really not that hard to parse anyway.
 const SCHEME_PREFIX: &str = "Token ";
@@ -121,7 +127,7 @@ impl AuthUser {
         // This also has the benefit of avoiding having to deal with securely storing the session
         // token on the frontend.
 
-        if claims.exp < OffsetDateTime::now_utc().unix_timestamp() {
+        if claims.exp + GRACE_PERIOD_SECONDS < OffsetDateTime::now_utc().unix_timestamp() {
             log::debug!("token expired");
             return Err(Error::Unauthorized);
         }
@@ -184,5 +190,115 @@ impl FromRequest for MaybeAuthUser {
                 })
                 .transpose()?,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use axum::http::HeaderValue;
+    use hmac::{Hmac, NewMac};
+    use jwt::SignWithKey;
+    use sha2::Sha384;
+    use sqlx::postgres::PgPoolOptions;
+    use std::sync::Arc;
+
+    const TEST_HMAC_KEY: &str = "test-hmac-key-for-unit-tests";
+
+    /// Build an `ApiContext` suitable for unit tests that never touch the database.
+    ///
+    /// `AuthUser::from_authorization` only ever reads `ctx.config.hmac_key`, so we can safely
+    /// hand it a lazily-connected `PgPool` here: `connect_lazy` never opens a real connection
+    /// until a query is actually run against the pool, which these tests never do. This avoids
+    /// requiring a live Postgres instance to run this test suite.
+    ///
+    /// Two `sqlx` 0.5.9 quirks around `connect_lazy` had to be worked around here (neither
+    /// involves actually reaching a database, both are just about satisfying `sqlx`'s internal
+    /// bookkeeping):
+    ///
+    /// - `PgPoolOptions::new()` defaults to non-`None` `idle_timeout`/`max_lifetime`, which
+    ///   would make the pool spawn a background "reaper" task. Disabled below, though it turns
+    ///   out not to be the whole story (see next point).
+    /// - Regardless of the above, `connect_lazy`/`connect_lazy_with` *unconditionally* spawns a
+    ///   task via `tokio::spawn` to opportunistically open the pool's minimum connections in the
+    ///   background; it does not block on it, but scheduling it still requires an ambient Tokio
+    ///   runtime context, which a plain synchronous `#[test]` does not have on its own
+    ///   (`tokio::spawn` panics with "there is no reactor running" otherwise). We build a
+    ///   throwaway runtime and `enter()` it (without `block_on`-ing anything) just so
+    ///   `connect_lazy` has somewhere to schedule that task; the task itself will fail to reach
+    ///   the fake host, which is irrelevant since these tests never issue a real query.
+    fn test_ctx() -> ApiContext {
+        let rt = tokio::runtime::Runtime::new().expect("failed to build a throwaway Tokio runtime");
+        let _guard = rt.enter();
+
+        let db = PgPoolOptions::new()
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .connect_lazy("postgres://user:pass@localhost/db")
+            .expect("connect_lazy should not require a reachable database");
+
+        let config = Config {
+            database_url: "postgres://user:pass@localhost/db".into(),
+            hmac_key: TEST_HMAC_KEY.into(),
+        };
+
+        ApiContext {
+            config: Arc::new(config),
+            db,
+        }
+    }
+
+    /// Build a raw `Authorization` header value for a hand-crafted JWT with the given `exp`,
+    /// signed with the same HMAC-SHA-384 scheme that `from_authorization` verifies against.
+    fn auth_header_with_exp(exp: i64) -> HeaderValue {
+        let hmac = Hmac::<Sha384>::new_from_slice(TEST_HMAC_KEY.as_bytes())
+            .expect("HMAC-SHA-384 can accept any key length");
+
+        let claims = AuthUserClaims {
+            // `uuid::Uuid::new_v4` requires the crate's "v4" feature, which this project does
+            // not enable (see Cargo.toml), so we build a fixed, valid `Uuid` by hand instead.
+            user_id: Uuid::from_u128(0x1234_5678_9abc_def0_1234_5678_9abc_def0),
+            exp,
+        };
+
+        let token = claims
+            .sign_with_key(&hmac)
+            .expect("HMAC signing should be infallible");
+
+        HeaderValue::from_str(&format!("{}{}", SCHEME_PREFIX, token))
+            .expect("token should be a valid header value")
+    }
+
+    #[test]
+    fn token_with_future_exp_is_accepted() {
+        let ctx = test_ctx();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+
+        let header = auth_header_with_exp(now + DEFAULT_SESSION_LENGTH.whole_seconds());
+
+        assert!(AuthUser::from_authorization(&ctx, &header).is_ok());
+    }
+
+    #[test]
+    fn token_within_grace_period_after_exp_is_accepted() {
+        let ctx = test_ctx();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+
+        // Expired 60 seconds ago, well within the 300 second grace period.
+        let header = auth_header_with_exp(now - 60);
+
+        assert!(AuthUser::from_authorization(&ctx, &header).is_ok());
+    }
+
+    #[test]
+    fn token_well_past_grace_period_is_rejected() {
+        let ctx = test_ctx();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+
+        // Expired 600 seconds ago, well past the 300 second grace period.
+        let header = auth_header_with_exp(now - 600);
+
+        assert!(AuthUser::from_authorization(&ctx, &header).is_err());
     }
 }

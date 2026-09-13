@@ -18,5 +18,9 @@ jobs:
     uses: sydes-examples/.github/.github/workflows/sydes-verify.yml@main
     with:
       repo_alias: app
+      sydes_ref: 0.2.0b8
+      model: openai:gpt-5.1
+      recovery_route_context: true
+      recovery_graph_path_search: true
     secrets:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
